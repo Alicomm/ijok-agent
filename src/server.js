@@ -18,9 +18,10 @@ import { decideGatekeeper } from "./gatekeeper.js";
 import { proverEnabled, generateProof, submitProofViaKurier } from "./prover.js";
 
 const MAX_BODY_BYTES = 1_000_000;
-// Proving + Kurier finalization share one budget so the total handler time
-// always stays inside the platform's 60-second hard deadline.
-const TASK_BUDGET_MS = 55_000;
+// Observed practice envelopes carry deadline_at = issued_at + 30s, so the
+// proving race is capped well inside that. (The field guide mentions a
+// 60-second hard deadline; the 30-second envelope wins.)
+const TASK_BUDGET_MS = 20_000;
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -110,8 +111,7 @@ export function createAgentServer({ seenStore, logger = console } = {}) {
 
     // Attach a Groth16 decision proof when proving is enabled and the task
     // is provable (PROOF_REUSED tasks are excluded from proof scoring).
-    // Proving and the Kurier submission share the remaining task budget;
-    // the documented response shape is { decision, reason_code, proof,
+    // The documented response shape is { decision, reason_code, proof,
     // public_signals } plus the echoed proof_tx audit pointer.
     if (decision.provable && proverEnabled()) {
       try {
@@ -123,13 +123,21 @@ export function createAgentServer({ seenStore, logger = console } = {}) {
         if (proved) {
           response.proof = proved.proof;
           response.public_signals = proved.publicSignals;
-          if (process.env.KURIER_API_KEY && remaining() > 3_000) {
-            const reference = await submitProofViaKurier(proved.proof, proved.publicSignals, {
-              budgetMs: remaining(),
-            });
-            logger.log(
-              JSON.stringify({ task_id: taskId, kurier_reference: reference })
-            );
+          if (process.env.KURIER_API_KEY) {
+            // Fire-and-forget: the Kurier attestation is a side record
+            // (its reference is NOT part of the response). Awaiting its
+            // finalization poll in the response path once cost ~25s per
+            // task and pushed answers past the platform deadline, so it
+            // runs after the response with its own generous budget.
+            submitProofViaKurier(proved.proof, proved.publicSignals, {
+              budgetMs: 120_000,
+            })
+              .then((reference) => {
+                if (reference) {
+                  logger.log(JSON.stringify({ task_id: taskId, kurier_reference: reference }));
+                }
+              })
+              .catch(() => {});
           }
         }
       } catch (err) {
